@@ -17,6 +17,9 @@ from astrbot.core.agent.message import TextPart
 
 from .perf_tracker import PerfTracker
 
+SELF_LEARNING_INJECTION_BEGIN = "<<SELF_LEARNING_INJECTION_BEGIN>>"
+SELF_LEARNING_INJECTION_END = "<<SELF_LEARNING_INJECTION_END>>"
+
 
 class LLMHookHandler:
     """Orchestrate LLM Hook context injection.
@@ -346,6 +349,11 @@ class LLMHookHandler:
         self, req: Any, injections: List[str], hook_start: float
     ) -> None:
         injection_text = "\n\n".join(injections)
+        wrapped_injection_text = (
+            f"{SELF_LEARNING_INJECTION_BEGIN}\n"
+            f"{injection_text}\n"
+            f"{SELF_LEARNING_INJECTION_END}"
+        )
 
         # Use AstrBot's extra_user_content_parts API to inject context.
         # This keeps system_prompt stable for LLM API prefix caching,
@@ -353,7 +361,7 @@ class LLMHookHandler:
         # the user message.
         if hasattr(req, "extra_user_content_parts"):
             req.extra_user_content_parts.append(
-                TextPart(text=f"<context>\n{injection_text}\n</context>")
+                TextPart(text=f"<context>\n{wrapped_injection_text}\n</context>")
             )
             logger.debug(
                 f"[LLM Hook] extra_user_content_parts 注入完成 - "
@@ -363,7 +371,7 @@ class LLMHookHandler:
             # Fallback for older AstrBot versions without extra_user_content_parts
             if not req.system_prompt:
                 req.system_prompt = ""
-            req.system_prompt += "\n\n" + injection_text
+            req.system_prompt += "\n\n" + wrapped_injection_text
             logger.debug(
                 f"[LLM Hook] system_prompt fallback 注入完成 - "
                 f"新增: {len(injection_text)} chars"
