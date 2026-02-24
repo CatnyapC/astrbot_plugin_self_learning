@@ -2,7 +2,7 @@
 Quart 应用工厂
 """
 import secrets
-from quart import Quart
+from quart import Quart, redirect
 from quart_cors import cors
 from astrbot.api import logger
 
@@ -41,7 +41,12 @@ def create_app(webui_config: WebUIConfig = None) -> Quart:
     # 注册错误处理
     register_error_handlers(app)
 
-    logger.info("✅ [WebUI] Quart 应用创建成功")
+    # 根路由重定向到 /api/
+    @app.route("/")
+    async def root_redirect():
+        return redirect("/api/")
+
+    logger.info(" [WebUI] Quart 应用创建成功")
 
     return app
 
@@ -59,6 +64,6 @@ def register_blueprints(app: Quart):
 
     for bp in blueprints:
         app.register_blueprint(bp)
-        logger.info(f"✅ [WebUI] 已注册蓝图: {bp.name}")
+        logger.info(f" [WebUI] 已注册蓝图: {bp.name}")
 
-    logger.info(f"✅ [WebUI] 共注册 {len(blueprints)} 个蓝图")
+    logger.info(f" [WebUI] 共注册 {len(blueprints)} 个蓝图")

@@ -33,10 +33,10 @@ class ColumnInfo:
 class TableDiff:
     """表结构差异"""
     table_name: str
-    missing_columns: List[str]  # 缺失的字段
-    extra_columns: List[str]  # 多余的字段
-    type_mismatches: List[Tuple[str, str, str]]  # (字段名, 期望类型, 实际类型)
-    nullable_mismatches: List[Tuple[str, bool, bool]]  # (字段名, 期望nullable, 实际nullable)
+    missing_columns: List[str] # 缺失的字段
+    extra_columns: List[str] # 多余的字段
+    type_mismatches: List[Tuple[str, str, str]] # (字段名, 期望类型, 实际类型)
+    nullable_mismatches: List[Tuple[str, bool, bool]] # (字段名, 期望nullable, 实际nullable)
 
 
 class SchemaValidator:
@@ -87,7 +87,7 @@ class SchemaValidator:
             Dict[str, TableDiff]: {表名: 差异信息}
         """
         logger.info("=" * 70)
-        logger.info("🔍 开始数据库表结构验证")
+        logger.info(" 开始数据库表结构验证")
         logger.info("=" * 70)
 
         all_diffs = {}
@@ -112,7 +112,7 @@ class SchemaValidator:
 
             # 表存在，验证结构
             validated_tables.append(table_name)
-            logger.info(f"\n📋 验证表: {table_name}")
+            logger.info(f"\n 验证表: {table_name}")
 
             # 比较表结构
             diff = await self._compare_table_structure(table_name, table_obj)
@@ -125,25 +125,25 @@ class SchemaValidator:
                 if auto_fix:
                     await self._fix_table_structure(table_name, table_obj, diff)
             else:
-                logger.info(f"  ✅ 表结构一致")
+                logger.info(f" 表结构一致")
 
         logger.info("\n" + "=" * 70)
 
         # 总结报告
         if created_tables:
-            logger.info(f"🆕 新建 {len(created_tables)} 个表: {', '.join(created_tables[:5])}" +
+            logger.info(f" 新建 {len(created_tables)} 个表: {', '.join(created_tables[:5])}" +
                        (f" 等" if len(created_tables) > 5 else ""))
 
         if validated_tables:
-            logger.info(f"✅ 验证 {len(validated_tables)} 个已存在的表")
+            logger.info(f" 验证 {len(validated_tables)} 个已存在的表")
 
         if all_diffs:
-            logger.info(f"⚠️  发现 {len(all_diffs)} 个表存在结构差异")
+            logger.info(f" 发现 {len(all_diffs)} 个表存在结构差异")
             if auto_fix:
-                logger.info("✅ 已尝试自动修复")
+                logger.info(" 已尝试自动修复")
         else:
             if validated_tables:
-                logger.info("✅ 所有表结构验证通过")
+                logger.info(" 所有表结构验证通过")
 
         logger.info("=" * 70)
 
@@ -176,14 +176,14 @@ class SchemaValidator:
         try:
             async with self.engine.begin() as conn:
                 await conn.run_sync(table_obj.create, checkfirst=True)
-            logger.info(f"  ✅ 表已创建: {table_name}")
+            logger.info(f" 表已创建: {table_name}")
         except Exception as e:
             # 检查是否是索引已存在的错误（这是正常情况，可以忽略）
             error_msg = str(e).lower()
             if 'index' in error_msg and 'already exists' in error_msg:
-                logger.info(f"  ✅ 表和索引已存在，跳过创建: {table_name}")
+                logger.info(f" 表和索引已存在，跳过创建: {table_name}")
             else:
-                logger.error(f"  ❌ 创建表失败: {e}")
+                logger.error(f" 创建表失败: {e}")
 
     async def _get_table_columns(self, table_name: str) -> Dict[str, ColumnInfo]:
         """
@@ -318,10 +318,10 @@ class SchemaValidator:
             'DOUBLE': 'FLOAT',
             'VARCHAR': 'STRING',
             'CHAR': 'STRING',
-            'BIGINT': 'BIGINT',  # 保持 BIGINT，因为它常用于时间戳
+            'BIGINT': 'BIGINT', # 保持 BIGINT，因为它常用于时间戳
             'TINYINT': 'INT',
             'SMALLINT': 'INT',
-            'TIMESTAMP': 'DATETIME',  # 统一时间类型
+            'TIMESTAMP': 'DATETIME', # 统一时间类型
         }
 
         return type_map.get(type_str, type_str)
@@ -343,7 +343,7 @@ class SchemaValidator:
             return True
 
         # STRING 类型族
-        string_types = {'STRING', 'TEXT', 'VARCHAR', 'CHAR'}
+        string_types = {'STRING', 'TEXT', 'VARCHAR', 'CHAR', 'MEDIUMTEXT', 'LONGTEXT'}
         if type1 in string_types and type2 in string_types:
             return True
 
@@ -359,18 +359,18 @@ class SchemaValidator:
     def _log_table_diff(self, diff: TableDiff):
         """记录表差异"""
         if diff.missing_columns:
-            logger.warning(f"  ⚠️  缺失字段: {', '.join(diff.missing_columns)}")
+            logger.warning(f" 缺失字段: {', '.join(diff.missing_columns)}")
 
         if diff.extra_columns:
-            logger.info(f"  ℹ️  额外字段(旧版本遗留): {', '.join(diff.extra_columns)}")
+            logger.info(f" 额外字段(旧版本遗留): {', '.join(diff.extra_columns)}")
 
         if diff.type_mismatches:
             for col, expected, actual in diff.type_mismatches:
-                logger.warning(f"  ⚠️  字段类型不匹配: {col} (期望: {expected}, 实际: {actual})")
+                logger.warning(f" 字段类型不匹配: {col} (期望: {expected}, 实际: {actual})")
 
         if diff.nullable_mismatches:
             for col, expected, actual in diff.nullable_mismatches:
-                logger.warning(f"  ⚠️  Nullable属性不匹配: {col} (期望: {expected}, 实际: {actual})")
+                logger.warning(f" Nullable属性不匹配: {col} (期望: {expected}, 实际: {actual})")
 
     async def _fix_table_structure(self, table_name: str, table_obj, diff: TableDiff):
         """
@@ -381,7 +381,7 @@ class SchemaValidator:
             table_obj: SQLAlchemy Table对象
             diff: 差异信息
         """
-        logger.info(f"  🔧 开始修复表结构...")
+        logger.info(f" 开始修复表结构...")
 
         # 1. 添加缺失字段
         if diff.missing_columns:
@@ -389,14 +389,14 @@ class SchemaValidator:
 
         # 2. 类型不匹配和nullable不匹配 - 警告用户
         if diff.type_mismatches:
-            logger.warning(f"  ⚠️  字段类型不匹配需要手动处理,建议重建表或手动ALTER TABLE")
+            logger.warning(f" 字段类型不匹配需要手动处理,建议重建表或手动ALTER TABLE")
 
         if diff.nullable_mismatches:
-            logger.warning(f"  ⚠️  Nullable属性不匹配可能影响数据完整性,请检查")
+            logger.warning(f" Nullable属性不匹配可能影响数据完整性,请检查")
 
         # 3. 额外字段 - 保留不删除 (向后兼容)
         if diff.extra_columns:
-            logger.info(f"  ℹ️  保留额外字段作为历史数据: {', '.join(diff.extra_columns)}")
+            logger.info(f" 保留额外字段作为历史数据: {', '.join(diff.extra_columns)}")
 
     async def _add_missing_columns(self, table_name: str, table_obj, missing_columns: List[str]):
         """添加缺失字段"""
@@ -417,10 +417,10 @@ class SchemaValidator:
                     await session.execute(text(alter_sql))
                     await session.commit()
 
-                logger.info(f"    ✅ 已添加字段: {col_name}")
+                logger.info(f" 已添加字段: {col_name}")
 
             except Exception as e:
-                logger.error(f"    ❌ 添加字段 {col_name} 失败: {e}")
+                logger.error(f" 添加字段 {col_name} 失败: {e}")
 
     def _get_column_type_sql(self, column) -> str:
         """获取字段类型的SQL表示"""
@@ -428,7 +428,9 @@ class SchemaValidator:
 
         # SQLAlchemy类型 -> SQL类型
         if self.db_type == 'sqlite':
-            if 'INTEGER' in col_type_str or 'INT' in col_type_str:
+            if 'BOOLEAN' in col_type_str:
+                return 'INTEGER'
+            elif 'INTEGER' in col_type_str or 'INT' in col_type_str:
                 return 'INTEGER'
             elif 'FLOAT' in col_type_str or 'REAL' in col_type_str:
                 return 'REAL'
@@ -442,7 +444,9 @@ class SchemaValidator:
                 return 'TEXT'
 
         elif self.db_type == 'mysql':
-            if 'INTEGER' in col_type_str:
+            if 'BOOLEAN' in col_type_str:
+                return 'TINYINT(1)'
+            elif 'INTEGER' in col_type_str:
                 return 'INT'
             elif 'BIGINT' in col_type_str:
                 return 'BIGINT'
@@ -471,10 +475,10 @@ class SchemaValidator:
 
         if isinstance(default_value, str):
             return f" DEFAULT '{default_value}'"
-        elif isinstance(default_value, (int, float)):
-            return f" DEFAULT {default_value}"
         elif isinstance(default_value, bool):
             return f" DEFAULT {1 if default_value else 0}"
+        elif isinstance(default_value, (int, float)):
+            return f" DEFAULT {default_value}"
 
         return ""
 
@@ -483,9 +487,7 @@ class SchemaValidator:
         await self.engine.dispose()
 
 
-# ============================================================
 # 便捷函数
-# ============================================================
 
 async def validate_and_fix_schema(
     db_url: str,

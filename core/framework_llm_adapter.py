@@ -18,9 +18,11 @@ class FrameworkLLMAdapter:
         self.refine_provider: Optional[Provider] = None
         self.reinforce_provider: Optional[Provider] = None
         self.providers_configured = 0
-        self._needs_lazy_init = False  # 延迟初始化标记
-        self._lazy_init_attempted = False  # 避免重复尝试
-        self._config = None  # 保存配置用于延迟初始化
+        self._needs_lazy_init = False
+        self._config = None
+        # 延迟初始化冷却: 避免在providers尚未就绪时高频重试
+        self._last_lazy_init_attempt: float = 0
+        self._lazy_init_cooldown: float = 30.0
 
         # 添加调用统计
         self.call_stats = {
@@ -37,29 +39,53 @@ class FrameworkLLMAdapter:
         # 保存配置用于可能的延迟初始化
         self._config = config
         self.providers_configured = 0
+        self.filter_provider = None
+        self.refine_provider = None
+        self.reinforce_provider = None
 
-        # ✅ 添加配置调试日志
-        logger.info(f"🔧 [LLM适配器] 开始初始化Provider，配置信息：")
-        logger.info(f"  - filter_provider_id: {config.filter_provider_id}")
-        logger.info(f"  - refine_provider_id: {config.refine_provider_id}")
-        logger.info(f"  - reinforce_provider_id: {config.reinforce_provider_id}")
+        # 添加配置调试日志
+        logger.info(f" [LLM适配器] 开始初始化Provider，配置信息：")
+        logger.info(f" - filter_provider_id: {config.filter_provider_id}")
+        logger.info(f" - refine_provider_id: {config.refine_provider_id}")
+        logger.info(f" - reinforce_provider_id: {config.reinforce_provider_id}")
 
         # 获取所有可用的Provider列表作为备选
         available_providers = []
         try:
             # 使用 get_all_providers() 方法获取所有 CHAT_COMPLETION 类型的 Provider
             all_providers = self.context.get_all_providers()
-            logger.info(f"  - 发现 {len(all_providers)} 个 Provider")
+            logger.info(f" - 发现 {len(all_providers)} 个 Provider")
 
             for provider in all_providers:
                 provider_meta = provider.meta()
                 if provider_meta.provider_type == ProviderType.CHAT_COMPLETION:
                     available_providers.append(provider)
-                    logger.debug(f"    ✅ Provider {provider_meta.id} 可用 (类型: {provider_meta.provider_type.value})")
+                    logger.debug(f" Provider {provider_meta.id} 可用 (类型: {provider_meta.provider_type.value})")
 
-            logger.info(f"🔍 发现 {len(available_providers)} 个可用的 CHAT_COMPLETION 类型 Provider")
+            logger.info(f" 发现 {len(available_providers)} 个可用的 CHAT_COMPLETION 类型 Provider")
         except Exception as e:
             logger.warning(f"获取可用Provider列表失败: {e}")
+
+        has_configured_provider_ids = bool(
+            config.filter_provider_id or config.refine_provider_id or config.reinforce_provider_id
+        )
+        provider_registry_ready = len(available_providers) > 0
+
+        # 启动早期常见场景：Provider 注册表尚未准备完成。
+        # 此时直接返回，避免误报“配置错误”日志。
+        if not provider_registry_ready:
+            self._needs_lazy_init = True
+            if has_configured_provider_ids:
+                logger.warning(
+                    " [LLM适配器] Provider 注册表尚未就绪（当前 0 个），"
+                    "跳过本次绑定并等待延迟重试。"
+                )
+            else:
+                logger.warning(
+                    " [LLM适配器] 当前没有可用 Provider，且未配置 provider_id，"
+                    "稍后将重试初始化。"
+                )
+            return
         
         # 初始化筛选Provider
         if config.filter_provider_id:
@@ -164,11 +190,14 @@ class FrameworkLLMAdapter:
         
         # 友好的配置状态提示
         if self.providers_configured == 0:
-            logger.error("❌ 没有可用的AI模型Provider。请在AstrBot中配置至少一个CHAT_COMPLETION类型的Provider，并在插件配置中指定Provider ID。")
+            logger.error(" 没有可用的AI模型Provider。请在AstrBot中配置至少一个CHAT_COMPLETION类型的Provider，并在插件配置中指定Provider ID。")
         elif self.providers_configured < 3:
-            logger.info(f"ℹ️ 已配置 {self.providers_configured}/3 个AI模型Provider。部分高级功能可能使用简化算法。")
+            logger.info(f" 已配置 {self.providers_configured}/3 个AI模型Provider。部分高级功能可能使用简化算法。")
         else:
-            logger.info(f"✅ 已成功配置所有 {self.providers_configured} 个AI模型Provider！")
+            logger.info(f" 已成功配置所有 {self.providers_configured} 个AI模型Provider！")
+
+        if self.providers_configured > 0:
+            self._needs_lazy_init = False
             
         # 显示最终配置结果
         config_summary = []
@@ -180,24 +209,28 @@ class FrameworkLLMAdapter:
             config_summary.append(f"强化: {self.reinforce_provider.meta().id}")
         
         if config_summary:
-            logger.info(f"📋 Provider配置摘要: {' | '.join(config_summary)}")
+            logger.info(f" Provider配置摘要: {' | '.join(config_summary)}")
         else:
-            logger.warning("⚠️ 所有Provider均未配置，插件功能将受限")
+            logger.warning(" 所有Provider均未配置，插件功能将受限")
 
     def _try_lazy_init(self):
-        """尝试延迟初始化Provider（仅执行一次）"""
-        if self._needs_lazy_init and not self._lazy_init_attempted and self._config:
-            self._lazy_init_attempted = True
-            logger.info("🔄 [LLM适配器] 尝试延迟初始化Provider...")
-            try:
-                self.initialize_providers(self._config)
-                if self.providers_configured > 0:
-                    self._needs_lazy_init = False
-                    logger.info(f"✅ [LLM适配器] 延迟初始化成功，已配置 {self.providers_configured} 个Provider")
-                else:
-                    logger.warning("⚠️ [LLM适配器] 延迟初始化仍未找到可用Provider")
-            except Exception as e:
-                logger.warning(f"⚠️ [LLM适配器] 延迟初始化失败: {e}")
+        """尝试延迟初始化Provider（带30秒冷却间隔，避免高频重试开销）"""
+        if not self._needs_lazy_init or not self._config:
+            return
+        now = time.time()
+        if now - self._last_lazy_init_attempt < self._lazy_init_cooldown:
+            return
+        self._last_lazy_init_attempt = now
+        logger.info("[LLM适配器] 尝试延迟初始化Provider...")
+        try:
+            self.initialize_providers(self._config)
+            if self.providers_configured > 0:
+                self._needs_lazy_init = False
+                logger.info(f"[LLM适配器] 延迟初始化成功，已配置 {self.providers_configured} 个Provider")
+            else:
+                logger.warning("[LLM适配器] 延迟初始化仍未找到可用Provider")
+        except Exception as e:
+            logger.warning(f"[LLM适配器] 延迟初始化失败: {e}")
 
     async def filter_chat_completion(
         self,
@@ -372,45 +405,7 @@ class FrameworkLLMAdapter:
             
             logger.error(f"强化模型调用失败: {e}")
             return None
-    
-    async def generate_response(self, prompt: str, temperature: float = 0.7, model_type: str = "general", **kwargs) -> Optional[str]:
-        """通用响应生成方法"""
-        start_time = time.time()
-        self.call_stats['general']['total_calls'] += 1
-        
-        try:
-            # 根据model_type选择对应的provider
-            if model_type == "filter" and self.filter_provider:
-                provider = self.filter_provider
-            elif model_type == "refine" and self.refine_provider:
-                provider = self.refine_provider
-            elif model_type == "reinforce" and self.reinforce_provider:
-                provider = self.reinforce_provider
-            else:
-                # 使用第一个可用的provider
-                provider = self.filter_provider or self.refine_provider or self.reinforce_provider
-            
-            if not provider:
-                logger.error("没有可用的Provider")
-                return None
-            
-            response = await provider.text_chat(prompt=prompt, **kwargs)
-            
-            # 统计调用时间
-            elapsed_time = time.time() - start_time
-            self.call_stats['general']['total_time'] += elapsed_time
-            
-            return response.completion_text if response else None
-            
-        except Exception as e:
-            # 统计错误
-            elapsed_time = time.time() - start_time
-            self.call_stats['general']['total_time'] += elapsed_time
-            self.call_stats['general']['errors'] += 1
-            
-            logger.error(f"通用模型调用失败: {e}")
-            return None
-    
+
     def get_call_statistics(self) -> Dict[str, Any]:
         """获取调用统计信息"""
         stats = {}
@@ -476,12 +471,12 @@ class FrameworkLLMAdapter:
     async def generate_response(self, prompt: str, temperature: float = 0.7, model_type: str = "filter") -> Optional[str]:
         """
         通用的生成响应方法，根据model_type调用对应的Provider
-        
+
         Args:
             prompt: 提示词
             temperature: 温度参数
-            model_type: 模型类型 ("filter", "refine", "reinforce")
-            
+            model_type: 模型类型 ("filter", "refine", "reinforce", "general")
+
         Returns:
             LLM响应文本，如果失败返回None
         """
@@ -492,6 +487,8 @@ class FrameworkLLMAdapter:
                 return await self.refine_chat_completion(prompt=prompt, temperature=temperature)
             elif model_type == "reinforce":
                 return await self.reinforce_chat_completion(prompt=prompt, temperature=temperature)
+            elif model_type == "general":
+                return await self.filter_chat_completion(prompt=prompt, temperature=temperature)
             else:
                 logger.error(f"不支持的模型类型: {model_type}")
                 return None
