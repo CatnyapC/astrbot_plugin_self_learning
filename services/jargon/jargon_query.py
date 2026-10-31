@@ -8,12 +8,18 @@ from astrbot.api import logger
 from cachetools import TTLCache
 
 from ..monitoring.instrumentation import monitored
+from .term_memory_query_service import TermMemoryQueryService, TermQueryHit
 
 
 class JargonQueryService:
     """黑话查询服务 - 供LLM工具调用"""
 
-    def __init__(self, db_manager, cache_ttl: int = 60):
+    def __init__(
+        self,
+        db_manager,
+        cache_ttl: int = 60,
+        term_memory_query_service: Optional[TermMemoryQueryService] = None,
+    ):
         """
         初始化黑话查询服务
 
@@ -22,6 +28,16 @@ class JargonQueryService:
             cache_ttl: 缓存有效期（秒），默认60秒
         """
         self.db = db_manager
+        self._term_memory_query_service = term_memory_query_service
+        cfg = getattr(db_manager, "config", None)
+        self._term_inject_max_items = max(
+            1, int(getattr(cfg, "term_memory_inject_max_items", 3) or 3)
+        )
+        self._term_soft_recall = bool(getattr(cfg, "term_memory_soft_recall", True))
+        self._term_soft_recall_cooldown_sec = max(
+            60,
+            int(getattr(cfg, "term_memory_soft_recall_cooldown_sec", 86400) or 86400),
+        )
 
         # 使用 cachetools.TTLCache - 自动过期管理
         self._cache = TTLCache(maxsize=500, ttl=cache_ttl)
@@ -55,6 +71,15 @@ class JargonQueryService:
             格式化的黑话含义说明文本
         """
         try:
+            if self._term_memory_query_service and chat_id:
+                hits = self._term_memory_query_service.query_terms_for_message(
+                    group_id=chat_id,
+                    text=keyword,
+                    limit=max(1, int(limit)),
+                )
+                if hits:
+                    return self._format_term_hits(hits)
+
             results = []
 
             # 1. 首先搜索群组特定黑话
@@ -120,6 +145,17 @@ class JargonQueryService:
             return cached
 
         try:
+            if self._term_memory_query_service:
+                hits = self._term_memory_query_service.query_terms_for_message(
+                    group_id=chat_id,
+                    text=" ".join(["术语", "黑话", "别称"]),
+                    limit=max(1, int(limit)),
+                )
+                if hits:
+                    result = self._format_term_hits(hits)
+                    self._set_to_cache(cache_key, result)
+                    return result
+
             jargon_list = await self.db.get_recent_jargon_list(
                 chat_id=chat_id,
                 limit=limit,
@@ -163,6 +199,25 @@ class JargonQueryService:
             如果找到黑话则返回解释文本,否则返回None
         """
         try:
+            if self._term_memory_query_service:
+                hits = self._term_memory_query_service.query_terms_for_message(
+                    group_id=chat_id,
+                    text=text,
+                    limit=self._term_inject_max_items,
+                )
+                if hits:
+                    formatted = self._format_term_hits(hits)
+                    if self._term_soft_recall:
+                        soft = self._term_memory_query_service.build_soft_recall_context(
+                            group_id=chat_id,
+                            hits=hits,
+                            cooldown_sec=self._term_soft_recall_cooldown_sec,
+                            max_items=1,
+                        )
+                        if soft:
+                            return f"{formatted}\n\n{soft}"
+                    return formatted
+
             # 先从缓存获取该群组的黑话列表
             cache_key = f"jargon_list_{chat_id}"
             jargon_list = self._get_from_cache(cache_key)
@@ -200,6 +255,23 @@ class JargonQueryService:
         except Exception as e:
             logger.error(f"检查黑话失败: {e}")
             return None
+
+    def _format_term_hits(self, hits: List[TermQueryHit]) -> str:
+        lines = ["术语记忆上下文:"]
+        for hit in hits:
+            definition = ""
+            if hit.definitions:
+                definition = hit.definitions[0].text
+            if not definition and hit.relations:
+                definition = hit.relations[0].text
+            if not definition:
+                continue
+            lines.append(f"- 「{hit.surface}」≈「{hit.entity.canonical_name}」: {definition}")
+            if hit.relations:
+                rel = hit.relations[0].text
+                if rel != definition:
+                    lines.append(f"  关联: {rel}")
+        return "\n".join(lines)
 
 
 # LLM工具函数定义 - 可直接注册为LLM工具

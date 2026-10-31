@@ -282,6 +282,70 @@
       }
     }
   },
+  "Term_Memory_Settings": {
+    "description": "术语记忆统一架构设置",
+    "type": "object",
+    "hint": "将术语记忆统一写入 AIC 的 Entity + Knowledge 结构化存储",
+    "items": {
+      "enable_term_memory_bridge": {
+        "description": "启用术语记忆桥接",
+        "type": "bool",
+        "hint": "开启后黑话/术语会写入 AIC 的 entity_registry + impression_evidence(knowledge)",
+        "default": true
+      },
+      "term_memory_aic_db_path": {
+        "description": "AIC 数据库路径",
+        "type": "string",
+        "hint": "可选。留空则自动推断为 plugin_data/astrbot_plugin_auto_impression_card/impressions.db",
+        "default": ""
+      },
+      "term_memory_migrate_on_startup": {
+        "description": "启动时迁移旧黑话",
+        "type": "bool",
+        "hint": "开启后会将 self_learning.jargon 历史数据一次性回填到 AIC 结构化记忆",
+        "default": true
+      },
+      "term_memory_soft_recall": {
+        "description": "启用术语轻回忆",
+        "type": "bool",
+        "hint": "在命中术语时提供低打扰自然提起提示，避免跨话题强插",
+        "default": true
+      },
+      "term_memory_soft_recall_cooldown_sec": {
+        "description": "术语轻回忆冷却秒数",
+        "type": "int",
+        "hint": "同一群同一术语两次轻回忆之间的最小间隔",
+        "default": 86400
+      },
+      "term_memory_inject_max_items": {
+        "description": "术语注入最大条数",
+        "type": "int",
+        "hint": "每次 LLM 请求最多注入多少条术语上下文，防止提示污染",
+        "default": 3
+      },
+      "term_confidence_min": {
+        "description": "术语最小置信度",
+        "type": "float",
+        "hint": "低于该阈值的知识证据不参与注入",
+        "default": 0.6
+      },
+      "term_alias_cache_ttl_sec": {
+        "description": "术语别名缓存秒数",
+        "type": "int",
+        "hint": "查询阶段 entity_aliases 缓存时长",
+        "default": 90
+      },
+      "term_alias_map": {
+        "description": "术语别名字典",
+        "type": "list",
+        "items": {
+          "type": "string"
+        },
+        "hint": "可选。手工指定归一映射，格式为 alias=>canonical（如 yyds=>永远的神）",
+        "default": []
+      }
+    }
+  },
   "Affection_System_Settings": {
     "description": "好感度系统设置",
     "type": "object",

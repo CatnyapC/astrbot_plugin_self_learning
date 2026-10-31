@@ -2,6 +2,9 @@
 # Python
 # ========================================
 __pycache__/
+/data/
+/query_results/
+/coverage.xml
 *.py[cod]
 *$py.class
 *.so

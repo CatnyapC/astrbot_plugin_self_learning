@@ -213,6 +213,7 @@ class MessagePipeline:
                 chat_messages,
                 len(recent_messages),
                 statistical_candidates=statistical_candidates,
+                recent_messages=recent_messages,
             )
 
             logger.debug(f"[JargonMining] Group {group_id} learning complete")

@@ -6,6 +6,7 @@
 import json
 import time
 import asyncio
+import re
 from typing import List, Dict, Optional, Any
 from datetime import datetime
 
@@ -15,6 +16,7 @@ from ...models.jargon import Jargon
 from ...core.framework_llm_adapter import FrameworkLLMAdapter
 from ...core.patterns import AsyncServiceBase
 from ...utils.json_utils import safe_parse_llm_json
+from .term_memory_ingest_service import TermMemoryIngestService
 
 
 class JargonInferenceEngine:
@@ -177,13 +179,21 @@ class JargonMiner(AsyncServiceBase):
         chat_id: str,
         llm_adapter: FrameworkLLMAdapter,
         db_manager,
-        config
+        config,
+        term_memory_ingest_service: Optional[TermMemoryIngestService] = None,
     ):
         super().__init__(f"jargon_miner_{chat_id}")
         self.chat_id = chat_id
         self.llm = llm_adapter
         self.db = db_manager
         self.config = config
+        self._term_memory_ingest_service = term_memory_ingest_service
+        self._term_memory_bridge_enabled = bool(
+            getattr(config, "enable_term_memory_bridge", True)
+            and term_memory_ingest_service is not None
+        )
+        # 当启用术语桥接时，仅保留短期触发状态（不再写 jargon 表作为长期真相）
+        self._term_state: Dict[str, Dict[str, Any]] = {}
 
         # 推断引擎
         self.inference_engine = JargonInferenceEngine(llm_adapter)
@@ -457,7 +467,11 @@ class JargonMiner(AsyncServiceBase):
             'updated_at': jargon.updated_at
         }
 
-    async def infer_and_update(self, jargon: Jargon):
+    async def infer_and_update(
+        self,
+        jargon: Jargon,
+        evidence_messages: Optional[List[Dict[str, Any]]] = None,
+    ):
         """推断黑话含义并更新"""
 
         try:
@@ -481,7 +495,10 @@ class JargonMiner(AsyncServiceBase):
             if result.get('no_info'):
                 # 信息不足，更新推断计数但不改变状态
                 jargon.last_inference_count = jargon.count
-                await self.db.update_jargon(self._jargon_to_dict(jargon))
+                if self._term_memory_bridge_enabled:
+                    self._update_term_state_from_jargon(jargon)
+                else:
+                    await self.db.update_jargon(self._jargon_to_dict(jargon))
                 return
 
             # 更新推断结果
@@ -494,11 +511,24 @@ class JargonMiner(AsyncServiceBase):
                 jargon.is_complete = True
 
             jargon.updated_at = datetime.now()
-            await self.db.update_jargon(self._jargon_to_dict(jargon))
+            if self._term_memory_bridge_enabled:
+                self._update_term_state_from_jargon(jargon)
+            else:
+                await self.db.update_jargon(self._jargon_to_dict(jargon))
 
             # 记录日志
             if jargon.is_jargon:
                 logger.info(f"[{self.chat_id}] 识别黑话: {jargon.content} → {jargon.meaning}")
+                if self._term_memory_bridge_enabled and jargon.meaning:
+                    await self._term_memory_ingest_service.ingest_term_evidence(
+                        group_id=self.chat_id,
+                        term=jargon.content,
+                        meaning=jargon.meaning,
+                        evidence_messages=evidence_messages,
+                        confidence=0.78,
+                        relation_surfaces=[jargon.content],
+                        source="self_learning_jargon_inference",
+                    )
             else:
                 logger.info(f"[{self.chat_id}] {jargon.content} 不是黑话")
 
@@ -510,6 +540,7 @@ class JargonMiner(AsyncServiceBase):
         chat_messages: str,
         message_count: int,
         statistical_candidates: Optional[List[Dict[str, Any]]] = None,
+        recent_messages: Optional[List[Dict[str, Any]]] = None,
     ):
         """Execute a single jargon learning iteration.
 
@@ -531,6 +562,9 @@ class JargonMiner(AsyncServiceBase):
                     {
                         "content": c["term"],
                         "raw_content": c.get("context_examples", []),
+                        "score": c.get("score"),
+                        "frequency": c.get("frequency"),
+                        "unique_users": c.get("unique_users"),
                     }
                     for c in statistical_candidates
                     if c.get("term")
@@ -550,12 +584,41 @@ class JargonMiner(AsyncServiceBase):
             # 2. 保存或更新数据库
             saved_count = 0
             updated_count = 0
+            message_index = self._build_message_index(recent_messages or [])
 
             for candidate in candidates:
                 content = candidate['content']
-                raw_content_list = candidate['raw_content']
+                if self._should_filter_candidate(content):
+                    continue
+                if self._should_skip_statistical_candidate(candidate):
+                    continue
+                raw_content_list = candidate.get('raw_content') or []
+                if isinstance(raw_content_list, str):
+                    raw_content_list = [raw_content_list]
+                elif not isinstance(raw_content_list, list):
+                    raw_content_list = []
 
-                jargon = await self.save_or_update_jargon(content, raw_content_list)
+                confidence = self._calc_candidate_confidence(candidate)
+                evidence_messages = self._resolve_evidence_messages(
+                    content=content,
+                    raw_content_list=raw_content_list,
+                    recent_messages=recent_messages or [],
+                    message_index=message_index,
+                )
+
+                if self._term_memory_bridge_enabled:
+                    await self._term_memory_ingest_service.ingest_term_entity(
+                        group_id=self.chat_id,
+                        term=content,
+                        evidence_messages=evidence_messages,
+                        confidence=confidence,
+                        source="self_learning_jargon_candidate",
+                    )
+
+                if self._term_memory_bridge_enabled:
+                    jargon = self._save_or_update_term_state(content, raw_content_list)
+                else:
+                    jargon = await self.save_or_update_jargon(content, raw_content_list)
 
                 if not jargon:
                     continue
@@ -565,10 +628,30 @@ class JargonMiner(AsyncServiceBase):
                 else:
                     updated_count += 1
 
+                if (
+                    self._term_memory_bridge_enabled
+                    and bool(jargon.is_jargon)
+                    and str(jargon.meaning or "").strip()
+                ):
+                    await self._term_memory_ingest_service.ingest_term_evidence(
+                        group_id=self.chat_id,
+                        term=jargon.content,
+                        meaning=jargon.meaning,
+                        evidence_messages=evidence_messages,
+                        relation_surfaces=[jargon.content],
+                        confidence=max(0.7, confidence),
+                        source="self_learning_jargon_confirmed",
+                    )
+
                 # 3. 检查是否需要推断
                 if self._should_infer_meaning(jargon):
                     # 异步执行推断，不阻塞主流程
-                    asyncio.create_task(self.infer_and_update(jargon))
+                    asyncio.create_task(
+                        self.infer_and_update(
+                            jargon,
+                            evidence_messages=evidence_messages,
+                        )
+                    )
 
             if saved_count or updated_count:
                 logger.info(
@@ -583,14 +666,207 @@ class JargonMiner(AsyncServiceBase):
             import traceback
             traceback.print_exc()
 
+    def _save_or_update_term_state(
+        self,
+        content: str,
+        raw_content_list: List[str],
+    ) -> Jargon:
+        """桥接模式下的短期触发状态：仅内存维护，不写 jargon 表。"""
+        key = str(content or "").strip()
+        now = datetime.now()
+        state = self._term_state.get(key)
+        if state is None:
+            state = {
+                "count": 1,
+                "raw_content": list(dict.fromkeys([x for x in raw_content_list if x])),
+                "meaning": None,
+                "is_jargon": None,
+                "last_inference_count": 0,
+                "is_complete": False,
+                "created_at": now,
+                "updated_at": now,
+            }
+            self._term_state[key] = state
+        else:
+            state["count"] = int(state.get("count", 0) or 0) + 1
+            existing = list(state.get("raw_content", []) or [])
+            state["raw_content"] = list(dict.fromkeys(existing + list(raw_content_list or [])))
+            state["updated_at"] = now
+
+        return Jargon(
+            content=key,
+            raw_content=json.dumps(state.get("raw_content", []), ensure_ascii=False),
+            meaning=state.get("meaning"),
+            is_jargon=state.get("is_jargon"),
+            count=int(state.get("count", 1) or 1),
+            last_inference_count=int(state.get("last_inference_count", 0) or 0),
+            is_complete=bool(state.get("is_complete", False)),
+            is_global=False,
+            chat_id=self.chat_id,
+            created_at=state.get("created_at"),
+            updated_at=state.get("updated_at"),
+        )
+
+    def _update_term_state_from_jargon(self, jargon: Jargon) -> None:
+        key = str(jargon.content or "").strip()
+        if not key:
+            return
+        raw_list = safe_parse_llm_json(jargon.raw_content) or []
+        if not isinstance(raw_list, list):
+            raw_list = [str(raw_list)] if raw_list else []
+        self._term_state[key] = {
+            "count": int(jargon.count or 0),
+            "raw_content": list(dict.fromkeys([str(x) for x in raw_list if str(x).strip()])),
+            "meaning": jargon.meaning,
+            "is_jargon": jargon.is_jargon,
+            "last_inference_count": int(jargon.last_inference_count or 0),
+            "is_complete": bool(jargon.is_complete),
+            "created_at": jargon.created_at or datetime.now(),
+            "updated_at": jargon.updated_at or datetime.now(),
+        }
+
+    @staticmethod
+    def _normalize_text(text: str) -> str:
+        return re.sub(r"\s+", " ", str(text or "").strip())
+
+    @classmethod
+    def _build_message_index(
+        cls,
+        recent_messages: List[Dict[str, Any]],
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        idx: Dict[str, List[Dict[str, Any]]] = {}
+        for row in list(recent_messages or []):
+            msg = cls._normalize_text(str((row or {}).get("message", "") or ""))
+            if not msg:
+                continue
+            idx.setdefault(msg, []).append(row)
+        for rows in idx.values():
+            rows.sort(key=lambda r: int(r.get("timestamp", 0) or 0), reverse=True)
+        return idx
+
+    @staticmethod
+    def _calc_candidate_confidence(candidate: Dict[str, Any]) -> float:
+        raw_score = candidate.get("score")
+        freq = int(candidate.get("frequency", 0) or 0)
+        conf = 0.72
+        if raw_score is not None:
+            try:
+                conf = 0.58 + (min(3.0, max(0.0, float(raw_score))) / 3.0) * 0.28
+            except Exception:
+                conf = 0.72
+        if freq >= 10:
+            conf += 0.04
+        if freq >= 20:
+            conf += 0.04
+        return max(0.45, min(0.94, round(conf, 4)))
+
+    @staticmethod
+    def _should_skip_statistical_candidate(candidate: Dict[str, Any]) -> bool:
+        """额外门控统计候选，降低泛词误报。"""
+        # LLM 提取候选通常不带统计分数字段，不在这里限制。
+        if candidate.get("score") is None and candidate.get("frequency") is None:
+            return False
+        try:
+            score = float(candidate.get("score", 0.0) or 0.0)
+        except Exception:
+            score = 0.0
+        try:
+            freq = int(candidate.get("frequency", 0) or 0)
+        except Exception:
+            freq = 0
+        try:
+            unique_users = int(candidate.get("unique_users", 0) or 0)
+        except Exception:
+            unique_users = 0
+
+        # 低频词大多为噪声，先不过门。
+        if freq < 6:
+            return True
+        # 低分候选不过门。
+        if score < 1.2:
+            return True
+        # 被过多人广泛使用且分不高，通常是通用词。
+        if unique_users >= 6 and score < 2.2:
+            return True
+        return False
+
+    @staticmethod
+    def _to_evidence_message(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        archive_id = int((row or {}).get("id", 0) or 0)
+        speaker_id = str((row or {}).get("sender_id", "") or "").strip()
+        if archive_id <= 0 or not speaker_id:
+            return None
+        return {
+            "archive_id": archive_id,
+            "speaker_id": speaker_id,
+            "message_text": str((row or {}).get("message", "") or "").strip(),
+            "message_ts": int((row or {}).get("timestamp", 0) or int(time.time())),
+            "consistency_tag": "support",
+        }
+
+    @classmethod
+    def _resolve_evidence_messages(
+        cls,
+        *,
+        content: str,
+        raw_content_list: List[str],
+        recent_messages: List[Dict[str, Any]],
+        message_index: Dict[str, List[Dict[str, Any]]],
+    ) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        seen: set[int] = set()
+
+        def _try_add(row: Dict[str, Any]) -> None:
+            ev = cls._to_evidence_message(row)
+            if not ev:
+                return
+            archive_id = int(ev["archive_id"])
+            if archive_id in seen:
+                return
+            seen.add(archive_id)
+            out.append(ev)
+
+        for raw in list(raw_content_list or []):
+            key = cls._normalize_text(raw)
+            if not key:
+                continue
+            for row in message_index.get(key, []):
+                _try_add(row)
+                if len(out) >= 3:
+                    return out
+
+        # 回退：从最近消息中搜索包含该词条的原文作为证据
+        ordered = sorted(
+            list(recent_messages or []),
+            key=lambda r: int((r or {}).get("timestamp", 0) or 0),
+            reverse=True,
+        )
+        needle = str(content or "").strip()
+        if needle:
+            for row in ordered:
+                msg = str((row or {}).get("message", "") or "")
+                if needle not in msg:
+                    continue
+                _try_add(row)
+                if len(out) >= 3:
+                    break
+        return out
+
 
 class JargonMinerManager:
     """黑话挖掘器管理器"""
 
-    def __init__(self, llm_adapter: FrameworkLLMAdapter, db_manager, config):
+    def __init__(
+        self,
+        llm_adapter: FrameworkLLMAdapter,
+        db_manager,
+        config,
+        term_memory_ingest_service: Optional[TermMemoryIngestService] = None,
+    ):
         self.llm = llm_adapter
         self.db = db_manager
         self.config = config
+        self._term_memory_ingest_service = term_memory_ingest_service
         self._miners: Dict[str, JargonMiner] = {}
 
     def get_miner(self, chat_id: str) -> JargonMiner:
@@ -600,7 +876,8 @@ class JargonMinerManager:
                 chat_id,
                 self.llm,
                 self.db,
-                self.config
+                self.config,
+                term_memory_ingest_service=self._term_memory_ingest_service,
             )
         return self._miners[chat_id]
 

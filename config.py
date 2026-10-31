@@ -3,10 +3,59 @@
 """
 import os
 import json
-from typing import List, Optional
+from typing import Any, List, Optional, Dict
 
 from pydantic import BaseModel, Field, ConfigDict
 from astrbot.api import logger
+
+
+def _normalize_term_alias_map(raw_value: Any) -> Dict[str, str]:
+    """Normalize schema-configured term alias map to Dict[str, str]."""
+    alias_map: Dict[str, str] = {}
+
+    def _add_pair(alias: Any, canonical: Any) -> None:
+        alias_text = str(alias).strip() if alias is not None else ""
+        canonical_text = str(canonical).strip() if canonical is not None else ""
+        if alias_text and canonical_text:
+            alias_map[alias_text] = canonical_text
+
+    if isinstance(raw_value, dict):
+        for k, v in raw_value.items():
+            _add_pair(k, v)
+        return alias_map
+
+    if isinstance(raw_value, str):
+        text = raw_value.strip()
+        if not text:
+            return alias_map
+        try:
+            parsed = json.loads(text)
+            if isinstance(parsed, dict):
+                for k, v in parsed.items():
+                    _add_pair(k, v)
+                return alias_map
+        except Exception:
+            pass
+        raw_value = [text]
+
+    if isinstance(raw_value, list):
+        for item in raw_value:
+            if isinstance(item, dict):
+                _add_pair(item.get("alias"), item.get("canonical"))
+                continue
+
+            if not isinstance(item, str):
+                continue
+            text = item.strip()
+            if not text:
+                continue
+            for sep in ("=>", "->", "=", "：", ":"):
+                if sep in text:
+                    alias, canonical = text.split(sep, 1)
+                    _add_pair(alias, canonical)
+                    break
+
+    return alias_map
 
 
 class PluginConfig(BaseModel):
@@ -168,6 +217,17 @@ class PluginConfig(BaseModel):
     goal_auto_detect: bool = True # 自动检测对话目标
     goal_max_conversation_history: int = 40 # 最大对话历史（轮次*2）
 
+    # 术语记忆统一架构（AIC 单一真相源）
+    enable_term_memory_bridge: bool = True
+    term_memory_aic_db_path: str = ""
+    term_memory_migrate_on_startup: bool = True
+    term_memory_soft_recall: bool = True
+    term_memory_soft_recall_cooldown_sec: int = 86400
+    term_memory_inject_max_items: int = 3
+    term_confidence_min: float = 0.6
+    term_alias_cache_ttl_sec: int = 90
+    term_alias_map: Dict[str, str] = Field(default_factory=dict)
+
     # 重构功能配置（新增）
     # 强制使用 SQLAlchemy ORM：统一 SQLite 和 MySQL 的表结构定义
     use_sqlalchemy: bool = True # 硬编码为 True，确保所有数据库操作使用 ORM 模型
@@ -223,6 +283,7 @@ class PluginConfig(BaseModel):
         repository_settings = config.get('Repository_Settings', {}) # 新增：Repository配置
         goal_driven_chat_settings = config.get('Goal_Driven_Chat_Settings', {}) # 新增：目标驱动对话设置
         v2_settings = config.get('V2_Architecture_Settings', {}) # v2架构升级设置
+        term_memory_settings = config.get('Term_Memory_Settings', {})
 
         # 添加调试日志：显示目标驱动对话配置数据
         logger.info(f" [配置加载] Goal_Driven_Chat_Settings原始数据: {goal_driven_chat_settings}")
@@ -339,6 +400,17 @@ class PluginConfig(BaseModel):
             goal_auto_detect=goal_driven_chat_settings.get('goal_auto_detect', True),
             goal_max_conversation_history=goal_driven_chat_settings.get('goal_max_conversation_history', 40),
 
+            # 术语记忆统一架构
+            enable_term_memory_bridge=term_memory_settings.get('enable_term_memory_bridge', True),
+            term_memory_aic_db_path=term_memory_settings.get('term_memory_aic_db_path', ''),
+            term_memory_migrate_on_startup=term_memory_settings.get('term_memory_migrate_on_startup', True),
+            term_memory_soft_recall=term_memory_settings.get('term_memory_soft_recall', True),
+            term_memory_soft_recall_cooldown_sec=term_memory_settings.get('term_memory_soft_recall_cooldown_sec', 86400),
+            term_memory_inject_max_items=term_memory_settings.get('term_memory_inject_max_items', 3),
+            term_confidence_min=term_memory_settings.get('term_confidence_min', 0.6),
+            term_alias_cache_ttl_sec=term_memory_settings.get('term_alias_cache_ttl_sec', 90),
+            term_alias_map=_normalize_term_alias_map(term_memory_settings.get('term_alias_map', {})),
+
             # Repository数据访问层配置
             default_review_limit=repository_settings.get('default_review_limit', 50),
             default_pattern_limit=repository_settings.get('default_pattern_limit', 10),
@@ -385,6 +457,15 @@ class PluginConfig(BaseModel):
 
         if not 0 <= self.style_update_threshold <= 1:
             errors.append("风格更新阈值必须在0-1之间")
+
+        if not 0 <= self.term_confidence_min <= 1:
+            errors.append("术语置信度阈值必须在0-1之间")
+
+        if self.term_memory_inject_max_items <= 0:
+            errors.append("术语注入最大条数必须大于0")
+
+        if self.term_memory_soft_recall_cooldown_sec < 0:
+            errors.append("术语软回忆冷却时间不能为负数")
 
         # 提示性警告而非错误
         provider_warnings = []

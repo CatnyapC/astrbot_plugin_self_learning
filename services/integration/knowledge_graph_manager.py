@@ -30,6 +30,15 @@ class KnowledgeGraphManager:
 
     _instance = None
     _initialized = False
+    _FIRST_PERSON_TOKENS = frozenset({
+        "我", "本人", "自己", "咱", "咱们", "俺", "我们",
+    })
+    _FIRST_PERSON_POSSESSIVES = ("我的", "咱的", "俺的", "我们的")
+    _UNRESOLVED_PRONOUNS = frozenset({
+        "你", "你们", "您的", "你家", "他", "她", "它", "他们", "她们", "它们",
+        "他的", "她的", "它的", "你的人", "他人",
+    })
+    _UNRESOLVED_POSSESSIVES = ("你的", "您的", "他的", "她的", "它的", "他们的", "她们的", "它们的")
 
     def __new__(cls, *args, **kwargs):
         if cls._instance is None:
@@ -79,6 +88,119 @@ class KnowledgeGraphManager:
     def _get_paragraph_hash(self, text: str) -> str:
         """获取段落的hash值"""
         return hashlib.sha256(text.encode('utf-8')).hexdigest()
+
+    @staticmethod
+    def _extract_message_fields(message: Any) -> Tuple[str, str, str]:
+        """提取消息文本、说话人 ID、说话人昵称。"""
+        if isinstance(message, dict):
+            text = str(message.get("content", "") or message.get("message", "") or "").strip()
+            speaker_id = str(
+                message.get("sender_id", "")
+                or message.get("user_id", "")
+                or message.get("speaker_id", "")
+                or ""
+            ).strip()
+            speaker_name = str(
+                message.get("sender_name", "")
+                or message.get("nickname", "")
+                or message.get("user_name", "")
+                or ""
+            ).strip()
+            return text, speaker_id, speaker_name
+
+        text = str(
+            getattr(message, "content", "")
+            or getattr(message, "message", "")
+            or ""
+        ).strip()
+        speaker_id = str(
+            getattr(message, "sender_id", "")
+            or getattr(message, "user_id", "")
+            or getattr(message, "speaker_id", "")
+            or ""
+        ).strip()
+        speaker_name = str(
+            getattr(message, "sender_name", "")
+            or getattr(message, "nickname", "")
+            or getattr(message, "user_name", "")
+            or ""
+        ).strip()
+        return text, speaker_id, speaker_name
+
+    @classmethod
+    def _build_processing_key(
+        cls,
+        text: str,
+        speaker_id: str = "",
+        speaker_name: str = "",
+    ) -> str:
+        """构造与说话人绑定的去重键，避免相同文本跨用户串扰。"""
+        identity = speaker_id or speaker_name
+        if not identity:
+            return text
+        return f"{identity}::{text}"
+
+    @classmethod
+    def _build_reference_context(
+        cls,
+        speaker_id: str = "",
+        speaker_name: str = "",
+    ) -> str:
+        """构造给 LLM 的指代解析上下文。"""
+        lines = [
+            "请严格按以下指代解析规则执行：",
+            f"- 当前消息说话人用户ID: {speaker_id or 'UNKNOWN'}",
+            f"- 当前消息说话人昵称: {speaker_name or 'UNKNOWN'}",
+            "- 第一人称（我/我的/我们/咱/俺）统一解析为当前消息说话人用户ID。",
+            "- 若实体是说话人的所属物，统一写成“<用户ID>的X”，不要保留“我的X”。",
+            "- 若“你/他/她/它/他们/她们”等代词无法在当前消息中唯一解析到明确用户ID，则不要输出该实体或关系。",
+            "- 涉及人物的实体命名，优先使用用户ID，不要使用'我'、'你'、'他'、'她'、'它'、'我的'、'你的'、'他的'等代词。",
+        ]
+        return "\n".join(lines)
+
+    @classmethod
+    def _contains_first_person_reference(cls, text: str) -> bool:
+        return any(token in text for token in cls._FIRST_PERSON_TOKENS) or any(
+            token in text for token in cls._FIRST_PERSON_POSSESSIVES
+        )
+
+    @classmethod
+    def _canonicalize_extracted_entity(
+        cls,
+        value: str,
+        *,
+        speaker_id: str = "",
+        speaker_name: str = "",
+    ) -> str:
+        """将 LLM 抽取结果规整为稳定实体名；无法消解的人称直接丢弃。"""
+        normalized = str(value or "").strip().strip("[](){}<>\"'`“”‘’「」")
+        if not normalized:
+            return ""
+
+        if speaker_name and speaker_id:
+            if normalized == speaker_name:
+                return speaker_id
+            possessive_prefix = f"{speaker_name}的"
+            if normalized.startswith(possessive_prefix):
+                return f"{speaker_id}{normalized[len(speaker_name):]}"
+
+        if normalized in cls._FIRST_PERSON_TOKENS:
+            return speaker_id
+
+        for prefix in cls._FIRST_PERSON_POSSESSIVES:
+            if normalized.startswith(prefix):
+                if not speaker_id:
+                    return ""
+                return f"{speaker_id}的{normalized[len(prefix):].lstrip()}"
+
+        if normalized in cls._UNRESOLVED_PRONOUNS:
+            return ""
+
+        for prefix in cls._UNRESOLVED_POSSESSIVES:
+            if normalized.startswith(prefix):
+                return ""
+
+        return normalized
 
     async def _is_paragraph_processed(self, text: str, group_id: str) -> bool:
         """检查段落是否已经处理过"""
@@ -191,7 +313,13 @@ class KnowledgeGraphManager:
         except Exception as e:
             logger.error(f"添加实体失败: {e}")
 
-    async def extract_entities_from_text(self, text: str) -> List[str]:
+    async def extract_entities_from_text(
+        self,
+        text: str,
+        *,
+        speaker_id: str = "",
+        speaker_name: str = "",
+    ) -> List[str]:
         """
         从文本中提取实体 - 采用MaiBot的实体提取方法
 
@@ -204,7 +332,10 @@ class KnowledgeGraphManager:
         try:
             from ...statics.prompts import ENTITY_EXTRACTION_PROMPT
 
-            prompt = ENTITY_EXTRACTION_PROMPT.format(text=text)
+            prompt = ENTITY_EXTRACTION_PROMPT.format(
+                text=text,
+                reference_context=self._build_reference_context(speaker_id, speaker_name),
+            )
 
             response = await self.llm_adapter.generate_response(
                 prompt,
@@ -215,16 +346,39 @@ class KnowledgeGraphManager:
             # 解析JSON响应
             entities = safe_parse_llm_json(response)
 
-            if isinstance(entities, list):
-                return [str(entity).strip() for entity in entities if entity and len(str(entity).strip()) > 1]
-            else:
+            if not isinstance(entities, list):
                 return []
+
+            normalized_entities: List[str] = []
+            seen: Set[str] = set()
+            for entity in entities:
+                normalized = self._canonicalize_extracted_entity(
+                    str(entity),
+                    speaker_id=speaker_id,
+                    speaker_name=speaker_name,
+                )
+                if len(normalized) <= 1 or normalized in seen:
+                    continue
+                normalized_entities.append(normalized)
+                seen.add(normalized)
+
+            if speaker_id and self._contains_first_person_reference(text) and speaker_id not in seen:
+                normalized_entities.append(speaker_id)
+
+            return normalized_entities
 
         except Exception as e:
             logger.error(f"提取实体失败: {e}")
             return []
 
-    async def extract_relations_from_text(self, text: str, entities: List[str]) -> List[Tuple[str, str, str]]:
+    async def extract_relations_from_text(
+        self,
+        text: str,
+        entities: List[str],
+        *,
+        speaker_id: str = "",
+        speaker_name: str = "",
+    ) -> List[Tuple[str, str, str]]:
         """
         从文本中提取关系三元组 - 采用MaiBot的RDF三元组提取方法
 
@@ -241,7 +395,8 @@ class KnowledgeGraphManager:
             entities_str = json.dumps(entities, ensure_ascii=False)
             prompt = RDF_TRIPLE_EXTRACTION_PROMPT.format(
                 text=text,
-                entities=entities_str
+                entities=entities_str,
+                reference_context=self._build_reference_context(speaker_id, speaker_name),
             )
 
             response = await self.llm_adapter.generate_response(
@@ -259,7 +414,25 @@ class KnowledgeGraphManager:
                     if isinstance(relation, list) and len(relation) == 3:
                         subject, predicate, obj = relation
                         if all(isinstance(x, str) and x.strip() for x in [subject, predicate, obj]):
-                            valid_relations.append((subject.strip(), predicate.strip(), obj.strip()))
+                            normalized_subject = self._canonicalize_extracted_entity(
+                                subject,
+                                speaker_id=speaker_id,
+                                speaker_name=speaker_name,
+                            )
+                            normalized_object = self._canonicalize_extracted_entity(
+                                obj,
+                                speaker_id=speaker_id,
+                                speaker_name=speaker_name,
+                            )
+                            normalized_predicate = predicate.strip()
+                            if normalized_subject and normalized_object and normalized_predicate:
+                                valid_relations.append(
+                                    (
+                                        normalized_subject,
+                                        normalized_predicate,
+                                        normalized_object,
+                                    )
+                                )
 
                 return valid_relations
             else:
@@ -278,23 +451,24 @@ class KnowledgeGraphManager:
             group_id: 群组ID
         """
         try:
-            # 兼容 dict 和 MessageData
-            if isinstance(message, dict):
-                text = (message.get('content', '') or message.get('message', '')).strip()
-            else:
-                text = (getattr(message, 'content', '') or getattr(message, 'message', '')).strip()
+            text, speaker_id, speaker_name = self._extract_message_fields(message)
+            processing_key = self._build_processing_key(text, speaker_id, speaker_name)
 
             # 检查文本长度和质量
             if len(text) < 10 or text.startswith('[') or text.startswith('http'):
                 return
 
             # 检查是否已经处理过
-            if await self._is_paragraph_processed(text, group_id):
+            if await self._is_paragraph_processed(processing_key, group_id):
                 logger.debug(f"段落已处理过，跳过: {text[:50]}...")
                 return
 
             # 提取实体
-            entities = await self.extract_entities_from_text(text)
+            entities = await self.extract_entities_from_text(
+                text,
+                speaker_id=speaker_id,
+                speaker_name=speaker_name,
+            )
 
             if not entities:
                 logger.debug(f"未提取到实体，跳过: {text[:50]}...")
@@ -304,14 +478,19 @@ class KnowledgeGraphManager:
             await self._update_entities(entities, group_id)
 
             # 提取关系
-            relations = await self.extract_relations_from_text(text, entities)
+            relations = await self.extract_relations_from_text(
+                text,
+                entities,
+                speaker_id=speaker_id,
+                speaker_name=speaker_name,
+            )
 
             # 更新关系信息
             if relations:
                 await self._update_relations(relations, group_id)
 
             # 标记段落为已处理
-            await self._mark_paragraph_processed(text, group_id)
+            await self._mark_paragraph_processed(processing_key, group_id)
 
             logger.info(f"知识图谱更新完成，群组: {group_id}，实体数: {len(entities)}，关系数: {len(relations)}")
 

@@ -50,12 +50,19 @@ class PersonaReviewService:
         """
         all_updates = []
 
+        def _log_count(label: str, count: int) -> None:
+            """简易降噪：0条使用debug，有数据使用info。"""
+            if count > 0:
+                logger.info(f"{label} {count} 条")
+            else:
+                logger.debug(f"{label} 0 条")
+
         # 1. 获取传统的人格更新审查
         if self.persona_updater:
             try:
-                logger.info("正在获取传统人格更新...")
+                logger.debug("正在获取传统人格更新...")
                 traditional_updates = await self.persona_updater.get_pending_persona_updates()
-                logger.info(f"获取到 {len(traditional_updates)} 个传统人格更新")
+                _log_count("获取到传统人格更新", len(traditional_updates))
 
                 # 将PersonaUpdateRecord对象转换为字典格式
                 for record in traditional_updates:
@@ -93,9 +100,9 @@ class PersonaReviewService:
         # 2. 获取人格学习审查（包括渐进式学习、表达学习等）
         if self.database_manager:
             try:
-                logger.info("正在获取人格学习审查...")
+                logger.debug("正在获取人格学习审查...")
                 persona_learning_reviews = await self.database_manager.get_pending_persona_learning_reviews()
-                logger.info(f"获取到 {len(persona_learning_reviews)} 个人格学习审查")
+                _log_count("获取到人格学习审查", len(persona_learning_reviews))
 
                 for review in persona_learning_reviews:
                     # 使用常量进行类型标准化和分类
@@ -169,9 +176,9 @@ class PersonaReviewService:
         # 3. 获取风格学习审查（Few-shot样本学习）
         if self.database_manager:
             try:
-                logger.info("正在获取风格学习审查...")
+                logger.debug("正在获取风格学习审查...")
                 style_reviews = await self.database_manager.get_pending_style_reviews()
-                logger.info(f"获取到 {len(style_reviews)} 个风格学习审查")
+                _log_count("获取到风格学习审查", len(style_reviews))
 
                 for review in style_reviews:
                     group_id = review['group_id']
@@ -227,15 +234,26 @@ class PersonaReviewService:
         all_updates.sort(key=lambda x: x.get('timestamp', 0), reverse=True)
 
         total = len(all_updates)
-
-        logger.info(f"共 {total} 条人格更新记录 (传统: {len([u for u in all_updates if u['review_source'] == 'traditional'])}, "
-                    f"人格学习: {len([u for u in all_updates if u['review_source'] == 'persona_learning'])}, "
-                    f"风格学习: {len([u for u in all_updates if u['review_source'] == 'style_learning'])})")
+        traditional_count = len([u for u in all_updates if u['review_source'] == 'traditional'])
+        persona_learning_count = len([u for u in all_updates if u['review_source'] == 'persona_learning'])
+        style_learning_count = len([u for u in all_updates if u['review_source'] == 'style_learning'])
+        summary_msg = (
+            f"共 {total} 条人格更新记录 (传统: {traditional_count}, "
+            f"人格学习: {persona_learning_count}, 风格学习: {style_learning_count})"
+        )
+        if total > 0:
+            logger.info(summary_msg)
+        else:
+            logger.debug(summary_msg)
 
         # 应用分页
         if limit > 0:
             paged_updates = all_updates[offset:offset + limit]
-            logger.info(f"分页返回: offset={offset}, limit={limit}, 本页 {len(paged_updates)} 条")
+            page_msg = f"分页返回: offset={offset}, limit={limit}, 本页 {len(paged_updates)} 条"
+            if len(paged_updates) > 0:
+                logger.info(page_msg)
+            else:
+                logger.debug(page_msg)
         else:
             paged_updates = all_updates
 

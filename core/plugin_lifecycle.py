@@ -89,10 +89,33 @@ class PluginLifecycle:
                 JargonQueryService,
                 JargonMinerManager,
                 JargonStatisticalFilter,
+                TermCanonicalizer,
+                TermMemoryIngestService,
+                TermMemoryQueryService,
             )
 
+            p.term_canonicalizer = TermCanonicalizer(
+                alias_map=getattr(plugin_config, "term_alias_map", {}) or {}
+            )
+            p.term_memory_ingest_service = TermMemoryIngestService(
+                config=plugin_config,
+                canonicalizer=p.term_canonicalizer,
+            )
+            # Keep resolved path for query service even if config path is empty.
+            plugin_config.term_memory_aic_db_path = (
+                getattr(plugin_config, "term_memory_aic_db_path", "")
+                or p.term_memory_ingest_service.db_path
+            )
+            p.term_memory_query_service = TermMemoryQueryService(
+                config=plugin_config,
+                canonicalizer=p.term_canonicalizer,
+            )
+            p.term_memory_query_service.set_db_path(p.term_memory_ingest_service.db_path)
+
             p.jargon_query_service = JargonQueryService(
-                db_manager=p.db_manager, cache_ttl=60
+                db_manager=p.db_manager,
+                cache_ttl=60,
+                term_memory_query_service=getattr(p, "term_memory_query_service", None),
             )
             logger.info("黑话查询服务已初始化（带60秒缓存）")
 
@@ -100,6 +123,7 @@ class PluginLifecycle:
                 llm_adapter=p.service_factory.create_framework_llm_adapter(),
                 db_manager=p.db_manager,
                 config=plugin_config,
+                term_memory_ingest_service=getattr(p, "term_memory_ingest_service", None),
             )
             logger.info("黑话挖掘管理器已初始化")
 
@@ -352,6 +376,25 @@ class PluginLifecycle:
                 logger.info("好感度管理服务启动成功")
             except Exception as e:
                 logger.error(f"好感度管理服务启动失败: {e}", exc_info=True)
+
+        # ------ 一次性术语历史迁移（legacy jargon -> AIC）------
+        if (
+            bool(getattr(plugin_config, "enable_term_memory_bridge", True))
+            and bool(getattr(plugin_config, "term_memory_migrate_on_startup", True))
+            and getattr(p, "term_memory_ingest_service", None) is not None
+        ):
+            try:
+                report = await p.term_memory_ingest_service.migrate_legacy_jargon(p.db_manager)
+                logger.info(
+                    "[TermMemory] legacy migration done: groups=%s seen=%s migrated=%s skipped=%s failed=%s",
+                    int(report.get("groups", 0)),
+                    int(report.get("rows_seen", 0)),
+                    int(report.get("rows_migrated", 0)),
+                    int(report.get("rows_skipped", 0)),
+                    int(report.get("rows_failed", 0)),
+                )
+            except Exception as e:
+                logger.error(f"[TermMemory] legacy migration failed: {e}", exc_info=True)
 
         # ------ V2 学习集成 ------
         if getattr(p, "v2_integration", None):
